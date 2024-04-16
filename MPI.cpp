@@ -1,157 +1,159 @@
 #include <iostream>
-#include <thread>
-#include <mutex>
-#include <condition_variable>
-#include <vector>
-#include <string>
-#include <queue>
 #include <fstream>
+#include <sstream>
+#include <vector>
 #include <map>
 #include <algorithm>
-#include <chrono>
-#include <unistd.h>
-
-using namespace std;
-
-mutex MUTEX; // Mutex for protecting shared resources
-
-int PThreads = 4;      // Number of producer threads
-int CThreads = 4;      // Number of consumer threads
-int Hours = 12;        // Duration after which to print summary
-int ProducerCount = 0; // Counter for producer threads
-int consumerCount = 0; // Counter for consumer threads
-int m = 0;             // Number of rows in traffic data
-
-condition_variable producer_cv, consumer_cv;
+#include <iomanip>
+#include <mpi.h>
 
 // Structure to represent traffic signal data
-struct traffic_data {
-    std::string timestamp;
+struct TrafficSignal
+{
+    int row_index;
+    std::string time_stamp;
     int light_id;
-    int num_cars;
+    int car_count;
 };
 
-queue<traffic_data> signal_queue; // Queue for storing traffic light data
-
-// Map to store traffic data for each timestamp
-map<string, vector<traffic_data>> timestamp_data;
-
-// Comparison function used for sorting traffic data based on the number of cars
-bool sort_method(const traffic_data& first, const traffic_data& second) {
-    return first.num_cars > second.num_cars;
-}
-
-// Producer thread function
-void *producer(void *args) {
-    ifstream infile("traffic_data.txt");
-    if (!infile.is_open()) {
-        cout << "Error: Unable to open file." << endl;
-        return nullptr;
+// Function to read traffic data from file
+void read_traffic_data(const std::string &filename, std::vector<TrafficSignal> &traffic_signals)
+{
+    std::ifstream file(filename);
+    if (!file.is_open())
+    {
+        std::cerr << "Error: Unable to open file: " << filename << std::endl;
+        return;
     }
 
-    std::string id, times, lightID, Cars_No;
-    while (getline(infile, id, ',') &&
-           getline(infile, times, ',') &&
-           getline(infile, lightID, ',') &&
-           getline(infile, Cars_No, '\n')) {
-        traffic_data td;
-        td.timestamp = times;
-        td.light_id = stoi(lightID);
-        td.num_cars = stoi(Cars_No);
-
-        unique_lock<mutex> lock(MUTEX);
-        signal_queue.push(td);
-        lock.unlock();
-        producer_cv.notify_all();
-
-        ProducerCount++;
-        sleep(rand() % 5);
+    std::string line;
+    while (std::getline(file, line))
+    {
+        std::istringstream iss(line);
+        TrafficSignal signal;
+        if (iss >> signal.time_stamp >> signal.light_id >> signal.car_count)
+        {
+            traffic_signals.push_back(signal);
+        }
+        else
+        {
+            std::cerr << "Error: Invalid data format in file: " << filename << std::endl;
+            traffic_signals.clear();
+            break;
+        }
     }
-    infile.close();
-    return nullptr;
+    file.close();
 }
 
-// Consumer thread function
-void *consumer(void *args) {
-    while (consumerCount < m) {
-        unique_lock<mutex> lock(MUTEX);
+// Function to find top congested traffic lights
+void find_top_congested_lights(const std::string &timestamp, const std::vector<TrafficSignal> &traffic_signals)
+{
+    std::vector<TrafficSignal> signals_for_timestamp;
+    for (const auto &signal : traffic_signals)
+    {
+        if (signal.time_stamp == timestamp)
+        {
+            signals_for_timestamp.push_back(signal);
+        }
+    }
 
-        if (!signal_queue.empty()) {
-            traffic_data td = signal_queue.front();
-            signal_queue.pop();
+    if (!signals_for_timestamp.empty())
+    {
+        // Sort signals based on car count
+        std::sort(signals_for_timestamp.begin(), signals_for_timestamp.end(),
+                  [](const TrafficSignal &a, const TrafficSignal &b)
+                  { return a.car_count > b.car_count; });
 
-            // Process traffic data
-            // Update totals of each traffic light here
-            // This part needs modification according to the structure of your data
-            cout << "Processing: " << td.timestamp << ", " << td.light_id << ", " << td.num_cars << endl;
+        std::cout << "Top 5 congested traffic lights for timestamp " << timestamp << ":" << std::endl;
+        for (size_t i = 0; i < std::min<size_t>(5, signals_for_timestamp.size()); ++i)
+        {
+            std::cout << "Light ID: " << signals_for_timestamp[i].light_id
+                      << ", Number of Cars: " << signals_for_timestamp[i].car_count << std::endl;
+        }
+        std::cout << std::endl;
+    }
+    else
+    {
+        std::cout << "No data available for timestamp " << timestamp << std::endl;
+    }
+}
 
-            // Store traffic data for each timestamp
-            timestamp_data[td.timestamp].push_back(td);
+int main(int argc, char **argv)
+{
+    MPI_Init(&argc, &argv);
 
-            consumerCount++;
-        } else {
-            consumer_cv.wait(lock, [] { return !signal_queue.empty(); });
+    int rank, size;
+    MPI_Comm_rank(MPI_COMM_WORLD, &rank);
+    MPI_Comm_size(MPI_COMM_WORLD, &size);
+
+    const std::string filename = "traffic_data.txt";
+
+    std::vector<TrafficSignal> traffic_signals;
+    std::vector<TrafficSignal> process_traffic_signals;
+
+    if (rank == 0)
+    {
+        read_traffic_data(filename, traffic_signals);
+
+        // Scatter data to all processes
+        int num_items_per_process = traffic_signals.size() / size;
+        int remainder = traffic_signals.size() % size;
+        std::vector<int> send_counts(size, num_items_per_process);
+        for (int i = 0; i < remainder; ++i)
+        {
+            send_counts[i]++;
+        }
+        std::vector<int> displacements(size, 0);
+        for (int i = 1; i < size; ++i)
+        {
+            displacements[i] = displacements[i - 1] + send_counts[i - 1];
         }
 
-        // Print summary if necessary
-        if (consumerCount % (Hours * PThreads) == 0 && consumerCount != 0) {
-            // Print top 5 sorted entries for each timestamp
-            for (auto& entry : timestamp_data) {
-                cout << "Timestamp: " << entry.first << endl;
-                cout << "Top 5 Entries:" << endl;
-                // Sort traffic data for this timestamp
-                sort(entry.second.begin(), entry.second.end(), sort_method);
-                // Print top 5 entries
-                int count = 0;
-                for (int i = 0; i < entry.second.size() && count < 5; ++i) {
-                    if (entry.second[i].light_id != entry.second[i + 1].light_id) {
-                        cout << "Traffic Light ID: " << entry.second[i].light_id << " | Number of Cars: " << entry.second[i].num_cars << endl;
-                        count++;
-                    }
-                }
-                cout << endl;
-            }
-        }
-
-        lock.unlock();
-        sleep(rand() % 5); // Simulate some processing time
+        process_traffic_signals.resize(send_counts[0]); // Resize to hold the data for the master process
+        MPI_Scatterv(traffic_signals.data(), send_counts.data(), displacements.data(), MPI_BYTE,
+                     process_traffic_signals.data(), send_counts[0] * sizeof(TrafficSignal), MPI_BYTE,
+                     0, MPI_COMM_WORLD);
     }
-    return nullptr;
-}
-
-int main() {
-    auto start = chrono::steady_clock::now();
-
-    pthread_t producers[PThreads];
-    pthread_t consumers[CThreads];
-
-    // Count the number of rows in traffic data
-    ifstream infile("traffic_data.txt");
-    string line;
-    while (getline(infile, line)) {
-        m++;
+    else
+    {
+        // Slave processes receive data from master
+        int num_items;
+        MPI_Status status;
+        MPI_Probe(0, MPI_ANY_TAG, MPI_COMM_WORLD, &status);
+        MPI_Get_count(&status, MPI_BYTE, &num_items);
+        process_traffic_signals.resize(num_items / sizeof(TrafficSignal));
+        MPI_Recv(process_traffic_signals.data(), num_items, MPI_BYTE, 0, MPI_ANY_TAG, MPI_COMM_WORLD, MPI_STATUS_IGNORE);
     }
-    infile.close();
 
-    // Create producer threads
-    for (long i = 0; i < PThreads; i++)
-        pthread_create(&producers[i], NULL, producer, (void *)i);
+    // Synchronize all processes
+    MPI_Barrier(MPI_COMM_WORLD);
 
-    // Create consumer threads
-    for (long i = 0; i < CThreads; i++)
-        pthread_create(&consumers[i], NULL, consumer, NULL);
+    double start_time = MPI_Wtime();
 
-    // Join producer threads
-    for (long i = 0; i < PThreads; i++)
-        pthread_join(producers[i], NULL);
+    // Process data
+    for (int hour = 0; hour < 8; ++hour)
+    {
+        std::ostringstream oss;
+        oss << std::setw(2) << std::setfill('0') << hour << ":00:00";
+        std::string timestamp = oss.str();
+        find_top_congested_lights(timestamp, process_traffic_signals);
+    }
 
-    // Join consumer threads
-    for (long i = 0; i < CThreads; i++)
-        pthread_join(consumers[i], NULL);
+    // Gather results from all processes to master
+    std::vector<TrafficSignal> all_traffic_signals(traffic_signals.size());
+    MPI_Gatherv(process_traffic_signals.data(), process_traffic_signals.size() * sizeof(TrafficSignal), MPI_BYTE,
+                all_traffic_signals.data(), process_traffic_signals.size() * sizeof(TrafficSignal), MPI_BYTE,
+                0, MPI_COMM_WORLD);
 
-    auto end = chrono::steady_clock::now();
-    auto duration = chrono::duration_cast<chrono::milliseconds>(end - start).count();
-    cout << "Total execution time: " << duration << " milliseconds" << endl;
+    double end_time = MPI_Wtime();
+    double execution_time = end_time - start_time;
 
+    if (rank == 0)
+    {
+        std::cout << "Total execution time: " << execution_time << " seconds.\n"
+                  << std::endl;
+    }
+
+    MPI_Finalize();
     return 0;
 }
